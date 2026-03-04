@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DEFAULT_MODEL,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
@@ -53,6 +54,26 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let currentModel: string | undefined;
+
+/** Get the active model (runtime override > DB override > .env default). */
+export function getModel(): string | undefined {
+  return currentModel;
+}
+
+/** Set the runtime model override. Pass undefined to reset to .env default. */
+export function setModel(model: string | undefined): void {
+  currentModel = model;
+  if (model) {
+    setRouterState('model', model);
+  } else {
+    setRouterState('model', '');
+  }
+  logger.info(
+    { model: model || DEFAULT_MODEL || '(SDK default)' },
+    'Model updated',
+  );
+}
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -66,10 +87,15 @@ function loadState(): void {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
+  const dbModel = getRouterState('model');
+  currentModel = dbModel || DEFAULT_MODEL || undefined;
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    {
+      groupCount: Object.keys(registeredGroups).length,
+      model: currentModel || '(SDK default)',
+    },
     'State loaded',
   );
 }
@@ -301,6 +327,7 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        model: currentModel,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -483,7 +510,7 @@ async function main(): Promise<void> {
   // Factories return null when credentials are missing, so unconfigured channels are skipped.
   for (const channelName of getRegisteredChannelNames()) {
     const factory = getChannelFactory(channelName)!;
-    const channel = factory(channelOpts);
+    const channel = factory({ ...channelOpts, getModel, setModel });
     if (!channel) {
       logger.warn(
         { channel: channelName },
