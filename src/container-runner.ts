@@ -259,6 +259,8 @@ function readSecrets(): Record<string, string> {
     'ANTHROPIC_AUTH_TOKEN',
     'GH_TOKEN',
     'LINEAR_API_KEY',
+    'FASTMAIL_EMAIL',
+    'FASTMAIL_APP_PASSWORD',
   ]);
 }
 
