@@ -10,20 +10,23 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
-import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
   isRootlessDocker,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
+import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -40,7 +43,6 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   model?: string;
-  secrets?: Record<string, string>;
 }
 
 export interface ContainerOutput {
@@ -77,7 +79,7 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
+    // Credentials are injected by the credential proxy, never exposed to containers.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -247,23 +249,6 @@ function ensureWorldWritable(dir: string): void {
   }
 }
 
-/**
- * Read allowed secrets from .env for passing to the container via stdin.
- * Secrets are never written to disk or mounted as files.
- */
-function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-    'GH_TOKEN',
-    'LINEAR_API_KEY',
-    'FASTMAIL_EMAIL',
-    'FASTMAIL_APP_PASSWORD',
-  ]);
-}
-
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -272,6 +257,26 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Route API traffic through the credential proxy (containers never see real secrets)
+  args.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+  );
+
+  // Mirror the host's auth method with a placeholder value.
+  // API key mode: SDK sends x-api-key, proxy replaces with real key.
+  // OAuth mode:   SDK exchanges placeholder token for temp API key,
+  //               proxy injects real OAuth token on that exchange request.
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  } else {
+    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Runtime-specific args for host gateway resolution
+  args.push(...hostGatewayArgs());
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -356,12 +361,8 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = readSecrets();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
-    // Remove secrets from input so they don't appear in logs
-    delete input.secrets;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
@@ -545,10 +546,20 @@ export async function runContainerAgent(
       const isError = code !== 0;
 
       if (isVerbose || isError) {
+        // On error, log input metadata only — not the full prompt.
+        // Full input is only included at verbose level to avoid
+        // persisting user conversation content on every non-zero exit.
+        if (isVerbose) {
+          logLines.push(`=== Input ===`, JSON.stringify(input, null, 2), ``);
+        } else {
+          logLines.push(
+            `=== Input Summary ===`,
+            `Prompt length: ${input.prompt.length} chars`,
+            `Session ID: ${input.sessionId || 'new'}`,
+            ``,
+          );
+        }
         logLines.push(
-          `=== Input ===`,
-          JSON.stringify(input, null, 2),
-          ``,
           `=== Container Args ===`,
           containerArgs.join(' '),
           ``,
@@ -726,7 +737,7 @@ export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>,
+  _registeredJids: Set<string>,
 ): void {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });

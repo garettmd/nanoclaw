@@ -3,11 +3,14 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DEFAULT_MODEL,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -22,6 +25,7 @@ import {
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
+  PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
   getAllChats,
@@ -47,6 +51,17 @@ import {
   formatOutbound,
   modelLabel,
 } from './router.js';
+import {
+  restoreRemoteControl,
+  startRemoteControl,
+  stopRemoteControl,
+} from './remote-control.js';
+import {
+  isSenderAllowed,
+  isTriggerAllowed,
+  loadSenderAllowlist,
+  shouldDropMessage,
+} from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -186,13 +201,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
+    const allowlistCfg = loadSenderAllowlist();
+    const hasTrigger = missedMessages.some(
+      (m) =>
+        TRIGGER_PATTERN.test(m.content.trim()) &&
+        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -233,7 +251,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
         const withModel = `${text}\n\n— ${modelLabel(currentModel)}`;
         await channel.sendMessage(chatJid, withModel);
@@ -415,8 +433,12 @@ async function startMessageLoop(): Promise<void> {
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
+            const allowlistCfg = loadSenderAllowlist();
+            const hasTrigger = groupMessages.some(
+              (m) =>
+                TRIGGER_PATTERN.test(m.content.trim()) &&
+                (m.is_from_me ||
+                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
           }
@@ -430,7 +452,7 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
+          const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
@@ -487,10 +509,18 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  restoreRemoteControl();
+
+  // Start credential proxy (containers route API calls through this)
+  const proxyServer = await startCredentialProxy(
+    CREDENTIAL_PROXY_PORT,
+    PROXY_BIND_HOST,
+  );
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -498,9 +528,78 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
+  // Handle /remote-control and /remote-control-end commands
+  async function handleRemoteControl(
+    command: string,
+    chatJid: string,
+    msg: NewMessage,
+  ): Promise<void> {
+    const group = registeredGroups[chatJid];
+    if (!group?.isMain) {
+      logger.warn(
+        { chatJid, sender: msg.sender },
+        'Remote control rejected: not main group',
+      );
+      return;
+    }
+
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
+    if (command === '/remote-control') {
+      const result = await startRemoteControl(
+        msg.sender,
+        chatJid,
+        process.cwd(),
+      );
+      if (result.ok) {
+        await channel.sendMessage(chatJid, result.url);
+      } else {
+        await channel.sendMessage(
+          chatJid,
+          `Remote Control failed: ${result.error}`,
+        );
+      }
+    } else {
+      const result = stopRemoteControl();
+      if (result.ok) {
+        await channel.sendMessage(chatJid, 'Remote Control session ended.');
+      } else {
+        await channel.sendMessage(chatJid, result.error);
+      }
+    }
+  }
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
+    onMessage: (chatJid: string, msg: NewMessage) => {
+      // Remote control commands — intercept before storage
+      const trimmed = msg.content.trim();
+      if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
+        handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
+          logger.error({ err, chatJid }, 'Remote control command error'),
+        );
+        return;
+      }
+
+      // Sender allowlist drop mode: discard messages from denied senders before storing
+      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+        const cfg = loadSenderAllowlist();
+        if (
+          shouldDropMessage(chatJid, cfg) &&
+          !isSenderAllowed(chatJid, msg.sender, cfg)
+        ) {
+          if (cfg.logDenied) {
+            logger.debug(
+              { chatJid, sender: msg.sender },
+              'sender-allowlist: dropping message (drop mode)',
+            );
+          }
+          return;
+        }
+      }
+      storeMessage(msg);
+    },
     onChatMetadata: (
       chatJid: string,
       timestamp: string,
@@ -570,6 +669,21 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    onTasksChanged: () => {
+      const tasks = getAllTasks();
+      const taskRows = tasks.map((t) => ({
+        id: t.id,
+        groupFolder: t.group_folder,
+        prompt: t.prompt,
+        schedule_type: t.schedule_type,
+        schedule_value: t.schedule_value,
+        status: t.status,
+        next_run: t.next_run,
+      }));
+      for (const group of Object.values(registeredGroups)) {
+        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+      }
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
