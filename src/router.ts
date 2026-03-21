@@ -27,6 +27,13 @@ export function formatOutbound(rawText: string): string {
   return text;
 }
 
+/** Return a short human-readable label for a model ID. */
+export function modelLabel(model: string | undefined): string {
+  if (!model) return 'default';
+  // Extract the friendly name: "claude-sonnet-4-6" → "sonnet-4-6"
+  return model.replace(/^claude-/, '');
+}
+
 export function routeOutbound(
   channels: Channel[],
   jid: string,
